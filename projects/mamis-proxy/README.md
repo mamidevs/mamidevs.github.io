@@ -1,271 +1,122 @@
-# mamis-proxy - Public Technical Brief
+# edge-proxy-mesh - Public Technical Brief
 
 Repository visibility: private
+Implementation repository: `mamis-proxy`
 
-This document is a public-safe architecture note for the private
-`mamis-proxy` repository. The portfolio card names the concept as
-`homemade-residential-proxy`; the implementation repository is `mamis-proxy`.
+This is a public-safe architecture note for `edge-proxy-mesh`, the portfolio
+display name for the private `mamis-proxy` implementation. It describes the
+system concept, protocol, and security model without exposing private source
+code.
 
-## One Line
+## One-Line Positioning
 
-`mamis-proxy` is a controlled distributed HTTP task proxy where worker machines
-connect outbound to a public Mastermind server over mTLS, receive sanitized HTTP
-tasks through gRPC bidirectional streams, execute target HTTP(S) requests with
-safe outbound dialers, and stream responses back to the client.
+`edge-proxy-mesh` is a controlled Go-based distributed HTTP task proxy: workers
+connect outbound to a public Mastermind service over mTLS, receive sanitized
+HTTP tasks over gRPC bidirectional streams, execute requests with safe outbound
+dialers, and stream responses back with per-task backpressure.
 
-## What It Is Not
+## Product Problem
 
-The system is intentionally not a generic open proxy.
+Some data workflows need traffic to originate from controlled worker networks
+without exposing worker machines to the public internet. A generic open proxy is
+too broad for that job: it creates abuse surface, weak policy boundaries, and
+hard-to-debug failure modes.
 
-V1 explicitly excludes:
+The system narrows the problem to controlled HTTP task execution:
 
-- `CONNECT`,
-- browser-compatible full proxying,
-- arbitrary TCP tunneling,
-- WebSocket tunneling,
-- raw client TLS pass-through,
-- unauthenticated forward proxy behavior.
+- workers initiate outbound connections, so no inbound worker ports are needed;
+- Mastermind owns authentication, policy, routing, and lifecycle;
+- workers execute sanitized HTTP(S) requests rather than tunneling raw bytes;
+- request and response bodies are streamed with explicit flow control;
+- SSRF protection is enforced before dispatch and again at dial time.
 
-The core principle is that a worker creates a new outbound HTTP request to the
-target. It does not blindly forward raw client bytes.
-
-## Main Actors
-
-| Actor | Responsibility |
-| --- | --- |
-| Client | Sends authenticated proxy task requests to Mastermind. |
-| Mastermind | Public entrypoint, auth, policy, routing, task lifecycle. |
-| Worker | Outbound-connected node that executes sanitized HTTP(S) tasks. |
-| Target | Final HTTP(S) website or API reached by the worker. |
-| Registry | Worker identity, certificate fingerprint, enabled state, tenancy tags. |
-
-## Architecture
+## Architecture Diagram
 
 ```mermaid
 flowchart LR
-  C["Client"] -->|"HTTPS + auth + target URL"| M["Mastermind"]
-  M -->|"auth, URL policy, SSRF preflight"| P["Policy layer"]
-  P -->|"TaskStart + body chunks"| S["gRPC bidirectional stream"]
-  S -->|"mTLS worker channel"| W["Worker"]
-  W -->|"safe HTTP client + SafeDialContext"| T["Target"]
-  T -->|"HTTP response"| W
-  W -->|"ResponseStart + body chunks"| M
-  M -->|"streamed response"| C
+  C["Client"] --> M["Mastermind API"]
+  M --> P["Auth + URL policy"]
+  P --> S["gRPC task stream"]
+  S --> W["mTLS worker"]
+  W --> D["SafeDialContext"]
+  D --> T["Target HTTP(S) service"]
+  T --> W
+  W --> S
+  S --> M
+  M --> C
 ```
 
-The design allows workers behind NAT or residential networks to participate
-without exposing inbound ports. Workers initiate the secure connection to the
-Mastermind server.
+## Data And Control Flow
 
-## Canonical Client API
+1. A client sends an authenticated HTTP task request to the Mastermind service.
+2. Mastermind extracts the target URL from the controlled API shape and applies
+   method, scheme, port, host, and allowlist policy.
+3. A worker is selected from the registered pool based on availability and
+   policy metadata.
+4. Mastermind sends `TaskStart` and request body chunks over a gRPC
+   bidirectional stream.
+5. The worker creates a new outbound HTTP request using a safe transport and a
+   guarded dial context.
+6. Response status, headers, body chunks, errors, and final task results are
+   streamed back to Mastermind.
+7. Chunk acknowledgements and task epochs keep retries, cancellations, and slow
+   clients deterministic.
 
-V1 uses a controlled API shape:
+## Stack
 
-- incoming path is a configured canonical path, commonly `/_proxy`,
-- target URL is passed through a control header,
-- incoming method becomes the target method,
-- incoming body becomes the target body,
-- proxy control headers are consumed by Mastermind and not forwarded.
+- Go
+- gRPC and Protocol Buffers
+- mTLS worker identity
+- BoltDB-style pending task storage design
+- Safe outbound HTTP transport
+- Structured audit logging
+- Kubernetes/cloud deployment model as the intended operating environment
 
-Absolute-form compatibility can exist for custom clients, but it is not browser
-proxy compatibility and does not enable `CONNECT`.
+## Security And Reliability Notes
 
-## Security Model
+- V1 is not a generic browser proxy. It explicitly excludes `CONNECT`, raw TCP
+  tunneling, WebSocket tunneling, raw TLS pass-through, and unauthenticated
+  forward-proxy behavior.
+- Mastermind blocks unsafe target input before a task is dispatched.
+- Workers resolve hostnames and block private, loopback, link-local, multicast,
+  documentation, and cloud metadata ranges at dial time.
+- Worker registration is tied to client certificates, registry state,
+  fingerprints, enabled flags, and revocation checks.
+- The protocol uses task IDs, attempt epochs, leader epochs, sequence numbers,
+  and chunk acknowledgements so partial failures can be observed and handled.
 
-The system treats both sides as untrusted:
+## Current State
 
-- client input is untrusted,
-- target response is untrusted,
-- worker transport is trusted only after mTLS and registry checks.
+The private repository includes the security-critical skeleton:
 
-### Mastermind controls
+- command entrypoints for Mastermind and Worker;
+- protobuf schema and generated Go bindings;
+- client-facing proxy API validation;
+- auth and user config loading;
+- target URL normalization and policy tests;
+- mTLS worker registry and revocation logic;
+- gRPC registration service;
+- safe worker dialer and HTTP transport;
+- health handlers and config validation.
 
-- Client authentication.
-- HTTP method allowlist per user.
-- target URL extraction and normalization.
-- allowed scheme and port checks.
-- raw IP target blocking.
-- per-user target allowlist.
-- request header sanitization.
-- deterministic error responses for invalid or blocked targets.
+Some runtime pieces are intentionally MVP-stage:
 
-### Worker controls
-
-- outbound HTTP client with no proxy chaining by default,
-- TLS minimum version configured,
-- no `InsecureSkipVerify`,
-- redirect following disabled,
-- `SafeDialContext` that resolves hostnames and blocks private, loopback,
-  link-local, multicast, documentation, and cloud metadata ranges.
-
-The two-layer SSRF model matters: Mastermind blocks obvious bad targets before
-dispatch, and the worker blocks unsafe resolved IPs at dial time.
-
-## Worker Identity and mTLS
-
-Workers register through gRPC using a client certificate.
-
-Registration validates:
-
-- peer certificate presence,
-- worker ID matching certificate identity,
-- supported protocol version,
-- certificate fingerprint against the worker registry,
-- enabled worker flag,
-- revocation list.
-
-The registry stores:
-
-- worker ID,
-- enabled state,
-- SHA-256 certificate fingerprint,
-- tags,
-- tenant IDs,
-- max concurrency override.
-
-Certificate comparisons normalize fingerprint formatting and use constant-time
-comparison where relevant.
-
-## gRPC Protocol Shape
-
-The protobuf protocol separates control messages from streamed body data.
-
-Core services:
-
-- `ProxyService.Register`
-- `ProxyService.StreamTasks`
-- `ProxyService.RenewCert`
-- `MastermindPeer.Heartbeat`
-- `MastermindPeer.AnnouncePromotion`
-
-Important messages:
-
-- `RegisterRequest` / `RegisterResponse`
-- `TaskStart`
-- `BodyChunk`
-- `ChunkAck`
-- `ResponseStart`
-- `TaskResult`
-- `CancelTask`
-- `LoadReport`
-- `ConfigUpdate`
-
-### Stream envelope design
-
-Mastermind sends:
-
-- task start,
-- request body chunks,
-- response chunk acknowledgements,
-- cancellation,
-- ping,
-- drain instruction,
-- config update.
-
-Worker sends:
-
-- response start,
-- response body chunks,
-- request chunk acknowledgements,
-- final task result,
-- load reports,
-- pong.
-
-## Backpressure and Chunking
-
-The design avoids sending entire request or response bodies as one protobuf
-message. Body data is chunked, and every chunk carries:
-
-- task ID,
-- attempt epoch,
-- sequence number,
-- end-of-body flag,
-- total bytes observed.
-
-`ChunkAck` enables per-task credit-based backpressure. This keeps one large
-response from overwhelming the stream or starving other tasks.
-
-## Attempt and Epoch Model
-
-The protocol carries:
-
-- `task_id`: globally unique task identity,
-- `attempt_epoch`: increments on retry or reassignment,
-- `leader_epoch`: protects against stale Mastermind leadership.
-
-These fields make retry, cancellation, duplicate delivery, and HA fencing
-observable and deterministic.
-
-## Error Model
-
-Errors are represented as a closed enum rather than arbitrary text.
-
-Groups include:
-
-- client cancellation/body errors,
-- target DNS/connect/TLS/timeout/reset errors,
-- policy URL/IP/scheme/port/method blocks,
-- body size/deadline/QoS failures,
-- worker shutdown/disconnect/no-worker states,
-- stale epoch and protocol violations,
-- internal failures.
-
-This keeps client behavior and monitoring consistent across implementations.
-
-## Current Implementation State
-
-The private repo already includes the core skeleton and security-critical
-building blocks:
-
-- Go module and command entrypoints for Mastermind and Worker.
-- protobuf schema and generated Go bindings.
-- HTTP handler for client-facing proxy API validation.
-- auth and user config loading.
-- target URL normalization and policy tests.
-- mTLS worker registry and revocation logic.
-- gRPC registration service.
-- safe worker dialer and HTTP transport.
-- health handlers.
-- config validation.
-
-Some runtime pieces are still MVP-stage:
-
-- full worker task dispatch,
-- response streaming from worker to client,
-- persistent pending task store,
-- retry reassignment after partial failures,
+- full task dispatch loop;
+- response streaming from worker to client;
+- durable pending-task reassignment;
 - production observability integration.
-
-## Why This Design Is Interesting
-
-The project is less about "proxying" and more about building a secure distributed
-task transport:
-
-- workers can live behind NAT,
-- Mastermind retains policy authority,
-- raw tunneling is excluded,
-- target I/O is bounded and auditable,
-- protocol fields make retries and leadership explicit,
-- SSRF defense exists both before dispatch and at the worker dial boundary.
 
 ## Roadmap
 
-1. Complete task routing and worker selection.
-2. Implement single-writer stream discipline for concurrent task sends.
-3. Add persistent pending task metadata and idempotency index.
-4. Implement request/response chunk credit accounting.
-5. Add response-start retry boundary: retry only before response headers reach client.
-6. Add structured metrics, audit logs, and trace IDs.
-7. Harden worker drain and certificate renewal flows.
+- Complete end-to-end worker dispatch and response streaming.
+- Add persistent pending-task replay with body-replay constraints.
+- Add worker health scoring, drain mode, and load-aware routing.
+- Add metrics and audit dashboards for operations.
+- Optional control-plane UI for worker registry, revocations, policy profiles,
+  and task health. This is a roadmap surface, not a current production claim.
 
 ## Portfolio Relevance
 
-This project demonstrates:
-
-- Go backend systems design,
-- gRPC bidirectional streaming,
-- mTLS worker identity,
-- SSRF-resistant outbound networking,
-- distributed task lifecycle modeling,
-- protocol design with backpressure and epochs,
-- security-oriented scope control.
+`edge-proxy-mesh` demonstrates backend and data-infrastructure depth: Go
+systems design, mTLS identity, gRPC streaming protocols, SSRF hardening,
+backpressure, failure modeling, and distributed worker coordination.
